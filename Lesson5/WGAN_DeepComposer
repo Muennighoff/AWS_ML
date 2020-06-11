@@ -1,0 +1,1415 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Introduction"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "This tutorial is a brief introduction to music generation using **Generative Adversarial Networks** (**GAN**s). \n",
+    "\n",
+    "The goal of this tutorial is to train a machine learning model using a dataset of Bach compositions so that the model learns to add accompaniments to a single track input melody. In other words, if the user provides a single piano track of a song such as \"twinkle twinkle little star\", the GAN model would add three other piano tracks to make the music sound more Bach-inspired.\n",
+    "\n",
+    "The proposed algorithm consists of two competing networks: a generator and a critic (discriminator). A generator is a deep neural network that learns to create new synthetic data that resembles the distribution of the dataset on which it was trained. A critic is another deep neural network that is trained to differentiate between real and synthetic data. The generator and the critic are trained in alternating cycles such that the generator learns to produce more and more realistic data (Bach-like music in this use case) while the critic iteratively gets better at learning to differentiate real data (Bach music) from the synthetic ones.\n",
+    "\n",
+    "As a result, the quality of music produced by the generator gets more and more realistic with time."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "![High level WGAN-GP architecture](images/dgan.png \"WGAN-GP architecture\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Dependencies\n",
+    "First, let's import all of the python packages we will use throughout the tutorial.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Please wait, while the required packages are being installed...\n",
+      "All the required packages are installed successfully...\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n",
+    "\n",
+    "# Permission is hereby granted, free of charge, to any person obtaining a copy of\n",
+    "# this software and associated documentation files (the \"Software\"), to deal in\n",
+    "# the Software without restriction, including without limitation the rights to\n",
+    "# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of\n",
+    "# the Software, and to permit persons to whom the Software is furnished to do so.\n",
+    "\n",
+    "# THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\n",
+    "# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS\n",
+    "# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR\n",
+    "# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER\n",
+    "# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN\n",
+    "# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.\n",
+    "\n",
+    "\n",
+    "# Create the environment\n",
+    "import subprocess\n",
+    "print(\"Please wait, while the required packages are being installed...\")\n",
+    "# subprocess.call(['./requirements.sh'])\n",
+    "print(\"All the required packages are installed successfully...\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 22,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#!conda update --all --y\n",
+    "#!pip install pypianoroll\n",
+    "#!pip install music21\n",
+    "#!pip install tensorflow-gpu==1.14.0\n",
+    "#!pip install pretty_midi\n",
+    "#!pip install --ignore-installed moviepy"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 21,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "1.14.0\n"
+     ]
+    }
+   ],
+   "source": [
+    "# IMPORTS\n",
+    "import os \n",
+    "import numpy as np\n",
+    "from PIL import Image\n",
+    "import logging\n",
+    "import pypianoroll\n",
+    "import scipy.stats\n",
+    "import pickle\n",
+    "import music21\n",
+    "from IPython import display\n",
+    "import matplotlib.pyplot as plt\n",
+    "\n",
+    "# Configure Tensorflow\n",
+    "import tensorflow as tf\n",
+    "print(tf.__version__)\n",
+    "tf.logging.set_verbosity(tf.logging.ERROR)\n",
+    "tf.enable_eager_execution()\n",
+    "\n",
+    "# Use this command to make a subset of GPUS visible to the jupyter notebook.\n",
+    "os.environ['CUDA_VISIBLE_DEVICES'] = '0'\n",
+    "os.environ[\"CUDA_DEVICE_ORDER\"]=\"PCI_BUS_ID\"\n",
+    "\n",
+    "# Utils library for plotting, loading and saving midi among other functions\n",
+    "from utils import display_utils, metrics_utils, path_utils, inference_utils, midi_utils\n",
+    "\n",
+    "LOGGER = logging.getLogger(\"gan.train\")\n",
+    "%matplotlib inline"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Configuration"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Here we configure paths to retrieve our dataset and save our experiments."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 23,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "root_dir = './Experiments'\n",
+    "\n",
+    "# Directory to save checkpoints\n",
+    "model_dir = os.path.join(root_dir,'2Bar')    # JSP: 229, Bach: 19199\n",
+    "\n",
+    "# Directory to save pianorolls during training\n",
+    "train_dir = os.path.join(model_dir, 'train')\n",
+    "\n",
+    "# Directory to save checkpoint generated during training\n",
+    "check_dir = os.path.join(model_dir, 'preload')\n",
+    "\n",
+    "# Directory to save midi during training\n",
+    "sample_dir = os.path.join(model_dir, 'sample')\n",
+    "\n",
+    "# Directory to save samples generated during inference\n",
+    "eval_dir = os.path.join(model_dir, 'eval')\n",
+    "\n",
+    "os.makedirs(train_dir, exist_ok=True)\n",
+    "os.makedirs(eval_dir, exist_ok=True)\n",
+    "os.makedirs(sample_dir, exist_ok=True)\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Data Preparation\n",
+    "\n",
+    "### Dataset summary\n",
+    "\n",
+    "In this tutorial, we use the [`JSB-Chorales-dataset`](http://www-etud.iro.umontreal.ca/~boulanni/icml2012), comprising 229 chorale snippets. A chorale is a hymn that is usually sung with a single voice playing a simple melody and three lower voices providing harmony. In this dataset, these voices are represented by four piano tracks.\n",
+    "\n",
+    "Let's listen to a song from this dataset."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 24,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "\n",
+       "                <div id='midiPlayerDiv298'></div>\n",
+       "                <link rel=\"stylesheet\" href=\"//cuthbertLab.github.io/music21j/css/m21.css\"\n",
+       "                    type=\"text/css\" />\n",
+       "                <script>\n",
+       "                require.config({\n",
+       "                    paths: {'music21': '//cuthbertLab.github.io/music21j/src/music21'}\n",
+       "                });\n",
+       "                require(['music21'], function() {\n",
+       "                               mp = new music21.miditools.MidiPlayer();\n",
+       "                               mp.addPlayer('#midiPlayerDiv298');\n",
+       "                               mp.base64Load('data:audio/midi;base64,TVRoZAAAAAYAAQAEBABNVHJrAAAAXQD/AwVQaWFubwDAAADgAEAAwAAA/1EDCSfAAP9YBAQCGAgAkGBkiACAYAAAkGFkiACAYQAAkGNkkACAYwAAkGFkiACAYQAAkGBkiACAYAAAkF5kkACAXgCIAP8vAE1UcmsAAABoAP8DBVBpYW5vAMAAAOAAQADAAAD/WAQEAhgIAJBcZJAAgFwAAJBbZIgAgFsAAJBcZIQAgFwAAJBbZIQAgFsAAJBZZIQAgFkAAJBbZIQAgFsAAJBcZIgAgFwAAJBbZJAAgFsAiAD/LwBNVHJrAAAAVgD/AwVQaWFubwDAAADgAEAAwAAA/1gEBAIYCACQV2SIAIBXAACQUGSEAIBQAACQUmSEAIBSAACQVGSQAIBUAACQVWSIAIBVAACQV2SYAIBXAIgA/y8ATVRyawAAAF8A/wMFUGlhbm8AwAAA4ABAAMAAAP9YBAQCGAgAkFBkiACAUAAAkE1kiACATQAAkEhkiACASAAAkE1kiACATQAAkEZkiACARgAAkERkiACARAAAkEtkkACASwCIAP8vAA==');\n",
+       "                        });\n",
+       "                </script>"
+      ],
+      "text/plain": [
+       "<IPython.core.display.HTML object>"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "display_utils.playmidi('./original_midi/MIDI-0.mid')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Data format - piano roll"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "For the purpose of this tutorial, we represent music from the JSB-Chorales dataset in the piano roll format.\n",
+    "\n",
+    "**Piano roll** is a discrete representation of music which is intelligible by many machine learning algorithms. Piano rolls can be viewed as a two-dimensional grid with \"Time\" on the horizontal axis and \"Pitch\" on the vertical axis. A one or zero in any particular cell in this grid indicates if a note was played or not at that time for that pitch.\n",
+    "\n",
+    "Let us look at a few piano rolls in our dataset. In this example, a single piano roll track has 32 discrete time steps and 128 pitches. We see four piano rolls here, each one representing a separate piano track in the song."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "<img src=\"images/pianoroll2.png\" alt=\"Dataset summary\" width=\"800\">\n",
+    "\n",
+    "You might notice this representation looks similar to an image. While the sequence of notes is often the natural way that people view music, many modern machine learning models instead treat music as images and leverage existing techniques within the computer vision domain. You will see such techniques used in our architecture later in this tutorial."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Why 32 time steps?**\n",
+    "\n",
+    "For the purpose of this tutorial, we sample *two* non-empty bars (https://en.wikipedia.org/wiki/Bar_(music)) from each song in the JSB-Chorales dataset. A **bar** (or **measure**) is a unit of composition and contains *four beats for songs* in our particular dataset (our songs are all in 4/4 time) :\n",
+    "\n",
+    "We’ve found that using a resolution of *four time steps per beat* captures enough of the musical detail in this dataset.\n",
+    "\n",
+    "This yields...\n",
+    "\n",
+    "$$ \\frac{4\\;timesteps}{1\\;beat} * \\frac{4\\;beats}{1\\;bar} * \\frac{2\\;bars}{1} = 32\\;timesteps $$\n",
+    "\n",
+    "Let us now load our dataset as a numpy array. Our dataset comprises 229 samples of 4 tracks (all tracks are piano). Each sample is a 32 time-step snippet of a song, so our dataset has a shape of...\n",
+    "(num_samples, time_steps, pitch_range, tracks) = (229, 32, 128, 4)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 26,
+   "metadata": {
+    "scrolled": true
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "(229, 32, 128, 4)\n"
+     ]
+    }
+   ],
+   "source": [
+    "training_data = np.load('./dataset/train.npy')\n",
+    "print(training_data.shape)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Let's see a sample of the data we'll feed into our model. The four graphs represent the four tracks."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 27,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "image/png": "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\n",
+      "text/plain": [
+       "<Figure size 1080x288 with 4 Axes>"
+      ]
+     },
+     "metadata": {
+      "image/png": {
+       "height": 265,
+       "width": 886
+      }
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "display_utils.show_pianoroll(training_data)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Load data "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We now create a Tensorflow dataset object from our numpy array to feed into our model. The dataset object helps us feed batches of data into our model. A batch is a subset of the data that is passed through the deep learning network before the weights are updated. Batching data is necessary in most training scenarios as our training environment might not be able to load the entire dataset into memory at once."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 28,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#Number of input data samples in a batch\n",
+    "BATCH_SIZE = 64\n",
+    "\n",
+    "#Shuffle buffer size for shuffling data\n",
+    "SHUFFLE_BUFFER_SIZE = 1000\n",
+    "\n",
+    "#Preloads PREFETCH_SIZE batches so that there is no idle time between batches\n",
+    "PREFETCH_SIZE = 4"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 29,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "data shape = (229, 32, 128, 4)\n"
+     ]
+    }
+   ],
+   "source": [
+    "def prepare_dataset(filename):\n",
+    "    \n",
+    "    \"\"\"Load the samples used for training.\"\"\"\n",
+    "    \n",
+    "    data = np.load(filename)\n",
+    "    data = np.asarray(data, dtype=np.float32)  # {-1, 1}\n",
+    "\n",
+    "    print('data shape = {}'.format(data.shape))\n",
+    "\n",
+    "    dataset = tf.data.Dataset.from_tensor_slices(data)\n",
+    "    dataset = dataset.shuffle(SHUFFLE_BUFFER_SIZE).repeat()\n",
+    "    dataset = dataset.batch(BATCH_SIZE, drop_remainder=True)\n",
+    "    dataset = dataset.prefetch(PREFETCH_SIZE)\n",
+    "\n",
+    "    return dataset \n",
+    "\n",
+    "dataset = prepare_dataset('./dataset/train.npy')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Model architecture\n",
+    "In this section, we will walk through the architecture of the proposed GAN.\n",
+    "\n",
+    "The model consists of two networks, a generator and a critic. These two networks work in a tight loop as following:\n",
+    "\n",
+    "* Generator:\n",
+    "    1. The generator takes in a batch of single-track piano rolls (melody) as the input and generates a batch of multi-track piano rolls as the output by adding accompaniments to each of the input music tracks. \n",
+    "    2. The critic then takes these generated music tracks and predicts how far it deviates from the real data present in your training dataset.\n",
+    "    3. This feedback from the critic is used by the generator to update its weights.\n",
+    "* Critic: As the generator gets better at creating better music accompaniments using the feedback from the critic, the critic needs to be retrained as well.\n",
+    "    1. Train the critic with the music tracks just generated by the generator as fake inputs and an equivalent number of songs from the original dataset as the real input. \n",
+    "* Alternate between training these two networks until the model converges and produces realistic music, beginning with the critic on the first iteration.\n",
+    "\n",
+    "We use a special type of GAN called the **Wasserstein GAN with Gradient Penalty** (or **WGAN-GP**) to generate music. While the underlying architecture of a WGAN-GP is very similar to vanilla variants of GAN, WGAN-GPs help overcome some of the commonly seen defects in GANs such as the vanishing gradient problem and mode collapse (see appendix for more details).\n",
+    "\n",
+    "Note our \"critic\" network is more generally called a \"discriminator\" network in the more general context of vanilla GANs."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Generator"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The generator is adapted from the U-Net architecture (a popular CNN that is used extensively in the computer vision domain), consisting of an “encoder” that maps the single track music data (represented as piano roll images) to a relatively lower dimensional “latent space“ and a ”decoder“ that maps the latent space back to multi-track music data.\n",
+    "\n",
+    "Here are the inputs provided to the generator:\n",
+    "\n",
+    "**Single-track piano roll input**: A single melody track of size (32, 128, 1) => (TimeStep, NumPitches, NumTracks) is provided as the input to the generator. \n",
+    "\n",
+    "**Latent noise vector**: A latent noise vector z of dimension (2, 8, 512) is also passed in as input and this is responsible for ensuring that there is a distinctive flavor to each output generated by the generator, even when the same input is provided.\n",
+    "\n",
+    "Notice from the figure below that the encoding layers of the generator on the left side and decoder layer on on the right side are connected to create a U-shape, thereby giving the name U-Net to this architecture."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "<img src=\"images/dgen.png\" alt=\"Generator architecture\" width=\"800\">"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "In this implementation, we build the generator following a simple four-level Unet architecture by combining `_conv2d`s and `_deconv2d`, where `_conv2d` compose the contracting path and `_deconv2d` forms the expansive path. "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 30,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def _conv2d(layer_input, filters, f_size=4, bn=True):\n",
+    "    \"\"\"Generator Basic Downsampling Block\"\"\"\n",
+    "    d = tf.keras.layers.Conv2D(filters, kernel_size=f_size, strides=2,\n",
+    "                               padding='same')(layer_input)\n",
+    "    d = tf.keras.layers.LeakyReLU(alpha=0.2)(d)\n",
+    "    if bn:\n",
+    "        d = tf.keras.layers.BatchNormalization(momentum=0.8)(d)\n",
+    "    return d\n",
+    "\n",
+    "\n",
+    "def _deconv2d(layer_input, pre_input, filters, f_size=4, dropout_rate=0):\n",
+    "    \"\"\"Generator Basic Upsampling Block\"\"\"\n",
+    "    u = tf.keras.layers.UpSampling2D(size=2)(layer_input)\n",
+    "    u = tf.keras.layers.Conv2D(filters, kernel_size=f_size, strides=1,\n",
+    "                               padding='same')(u)\n",
+    "    u = tf.keras.layers.BatchNormalization(momentum=0.8)(u)\n",
+    "    u = tf.keras.layers.ReLU()(u)\n",
+    "\n",
+    "    if dropout_rate:\n",
+    "        u = tf.keras.layers.Dropout(dropout_rate)(u)\n",
+    "        \n",
+    "    u = tf.keras.layers.Concatenate()([u, pre_input])\n",
+    "    return u\n",
+    "\n",
+    "    \n",
+    "def build_generator(condition_input_shape=(32, 128, 1), filters=64,\n",
+    "                    instruments=4, latent_shape=(2, 8, 512)):\n",
+    "    \"\"\"Buld Generator\"\"\"\n",
+    "    c_input = tf.keras.layers.Input(shape=condition_input_shape)\n",
+    "    z_input = tf.keras.layers.Input(shape=latent_shape)\n",
+    "\n",
+    "    d1 = _conv2d(c_input, filters, bn=False)\n",
+    "    d2 = _conv2d(d1, filters * 2)\n",
+    "    d3 = _conv2d(d2, filters * 4)\n",
+    "    d4 = _conv2d(d3, filters * 8)\n",
+    "\n",
+    "    d4 = tf.keras.layers.Concatenate(axis=-1)([d4, z_input])\n",
+    "\n",
+    "    u4 = _deconv2d(d4, d3, filters * 4)\n",
+    "    u5 = _deconv2d(u4, d2, filters * 2)\n",
+    "    u6 = _deconv2d(u5, d1, filters)\n",
+    "\n",
+    "    u7 = tf.keras.layers.UpSampling2D(size=2)(u6)\n",
+    "    output = tf.keras.layers.Conv2D(instruments, kernel_size=4, strides=1,\n",
+    "                               padding='same', activation='tanh')(u7)  # 32, 128, 4\n",
+    "\n",
+    "    generator = tf.keras.models.Model([c_input, z_input], output, name='Generator')\n",
+    "\n",
+    "    return generator"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Let us now dive into each layer of the generator to see the inputs/outputs at each layer."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 32,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Model: \"Generator\"\n",
+      "__________________________________________________________________________________________________\n",
+      "Layer (type)                    Output Shape         Param #     Connected to                     \n",
+      "==================================================================================================\n",
+      "input_3 (InputLayer)            [(None, 32, 128, 1)] 0                                            \n",
+      "__________________________________________________________________________________________________\n",
+      "conv2d_8 (Conv2D)               (None, 16, 64, 64)   1088        input_3[0][0]                    \n",
+      "__________________________________________________________________________________________________\n",
+      "leaky_re_lu_4 (LeakyReLU)       (None, 16, 64, 64)   0           conv2d_8[0][0]                   \n",
+      "__________________________________________________________________________________________________\n",
+      "conv2d_9 (Conv2D)               (None, 8, 32, 128)   131200      leaky_re_lu_4[0][0]              \n",
+      "__________________________________________________________________________________________________\n",
+      "leaky_re_lu_5 (LeakyReLU)       (None, 8, 32, 128)   0           conv2d_9[0][0]                   \n",
+      "__________________________________________________________________________________________________\n",
+      "batch_normalization_6 (BatchNor (None, 8, 32, 128)   512         leaky_re_lu_5[0][0]              \n",
+      "__________________________________________________________________________________________________\n",
+      "conv2d_10 (Conv2D)              (None, 4, 16, 256)   524544      batch_normalization_6[0][0]      \n",
+      "__________________________________________________________________________________________________\n",
+      "leaky_re_lu_6 (LeakyReLU)       (None, 4, 16, 256)   0           conv2d_10[0][0]                  \n",
+      "__________________________________________________________________________________________________\n",
+      "batch_normalization_7 (BatchNor (None, 4, 16, 256)   1024        leaky_re_lu_6[0][0]              \n",
+      "__________________________________________________________________________________________________\n",
+      "conv2d_11 (Conv2D)              (None, 2, 8, 512)    2097664     batch_normalization_7[0][0]      \n",
+      "__________________________________________________________________________________________________\n",
+      "leaky_re_lu_7 (LeakyReLU)       (None, 2, 8, 512)    0           conv2d_11[0][0]                  \n",
+      "__________________________________________________________________________________________________\n",
+      "batch_normalization_8 (BatchNor (None, 2, 8, 512)    2048        leaky_re_lu_7[0][0]              \n",
+      "__________________________________________________________________________________________________\n",
+      "input_4 (InputLayer)            [(None, 2, 8, 512)]  0                                            \n",
+      "__________________________________________________________________________________________________\n",
+      "concatenate_4 (Concatenate)     (None, 2, 8, 1024)   0           batch_normalization_8[0][0]      \n",
+      "                                                                 input_4[0][0]                    \n",
+      "__________________________________________________________________________________________________\n",
+      "up_sampling2d_4 (UpSampling2D)  (None, 4, 16, 1024)  0           concatenate_4[0][0]              \n",
+      "__________________________________________________________________________________________________\n",
+      "conv2d_12 (Conv2D)              (None, 4, 16, 256)   4194560     up_sampling2d_4[0][0]            \n",
+      "__________________________________________________________________________________________________\n",
+      "batch_normalization_9 (BatchNor (None, 4, 16, 256)   1024        conv2d_12[0][0]                  \n",
+      "__________________________________________________________________________________________________\n",
+      "re_lu_3 (ReLU)                  (None, 4, 16, 256)   0           batch_normalization_9[0][0]      \n",
+      "__________________________________________________________________________________________________\n",
+      "concatenate_5 (Concatenate)     (None, 4, 16, 512)   0           re_lu_3[0][0]                    \n",
+      "                                                                 batch_normalization_7[0][0]      \n",
+      "__________________________________________________________________________________________________\n",
+      "up_sampling2d_5 (UpSampling2D)  (None, 8, 32, 512)   0           concatenate_5[0][0]              \n",
+      "__________________________________________________________________________________________________\n",
+      "conv2d_13 (Conv2D)              (None, 8, 32, 128)   1048704     up_sampling2d_5[0][0]            \n",
+      "__________________________________________________________________________________________________\n",
+      "batch_normalization_10 (BatchNo (None, 8, 32, 128)   512         conv2d_13[0][0]                  \n",
+      "__________________________________________________________________________________________________\n",
+      "re_lu_4 (ReLU)                  (None, 8, 32, 128)   0           batch_normalization_10[0][0]     \n",
+      "__________________________________________________________________________________________________\n",
+      "concatenate_6 (Concatenate)     (None, 8, 32, 256)   0           re_lu_4[0][0]                    \n",
+      "                                                                 batch_normalization_6[0][0]      \n",
+      "__________________________________________________________________________________________________\n",
+      "up_sampling2d_6 (UpSampling2D)  (None, 16, 64, 256)  0           concatenate_6[0][0]              \n",
+      "__________________________________________________________________________________________________\n",
+      "conv2d_14 (Conv2D)              (None, 16, 64, 64)   262208      up_sampling2d_6[0][0]            \n",
+      "__________________________________________________________________________________________________\n",
+      "batch_normalization_11 (BatchNo (None, 16, 64, 64)   256         conv2d_14[0][0]                  \n",
+      "__________________________________________________________________________________________________\n",
+      "re_lu_5 (ReLU)                  (None, 16, 64, 64)   0           batch_normalization_11[0][0]     \n",
+      "__________________________________________________________________________________________________\n",
+      "concatenate_7 (Concatenate)     (None, 16, 64, 128)  0           re_lu_5[0][0]                    \n",
+      "                                                                 leaky_re_lu_4[0][0]              \n",
+      "__________________________________________________________________________________________________\n",
+      "up_sampling2d_7 (UpSampling2D)  (None, 32, 128, 128) 0           concatenate_7[0][0]              \n",
+      "__________________________________________________________________________________________________\n",
+      "conv2d_15 (Conv2D)              (None, 32, 128, 4)   8196        up_sampling2d_7[0][0]            \n",
+      "==================================================================================================\n",
+      "Total params: 8,273,540\n",
+      "Trainable params: 8,270,852\n",
+      "Non-trainable params: 2,688\n",
+      "__________________________________________________________________________________________________\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Models\n",
+    "generator = build_generator()\n",
+    "generator.summary()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Critic (Discriminator)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The goal of the critic is to provide feedback to the generator about how realistic the generated piano rolls are, so that the generator can learn to produce more realistic data. The critic provides this feedback by outputting a scalar that  represents how “real” or “fake” a piano roll is.\n",
+    "\n",
+    "Since the critic tries to classify data as “real” or “fake”, it is not very different from commonly used binary classifiers.  We use a simple architecture for the critic, composed of four convolutional layers and a dense layer at the end."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "<img src=\"images/ddis.png\" alt=\"Discriminator architecture\" width=\"800\">"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 33,
+   "metadata": {
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "def _build_critic_layer(layer_input, filters, f_size=4):\n",
+    "    \"\"\"\n",
+    "    This layer decreases the spatial resolution by 2:\n",
+    "\n",
+    "        input:  [batch_size, in_channels, H, W]\n",
+    "        output: [batch_size, out_channels, H/2, W/2]\n",
+    "    \"\"\"\n",
+    "    d = tf.keras.layers.Conv2D(filters, kernel_size=f_size, strides=2,\n",
+    "                               padding='same')(layer_input)\n",
+    "    # Critic does not use batch-norm\n",
+    "    d = tf.keras.layers.LeakyReLU(alpha=0.2)(d) \n",
+    "    return d\n",
+    "\n",
+    "\n",
+    "def build_critic(pianoroll_shape=(32, 128, 4), filters=64):\n",
+    "    \"\"\"WGAN critic.\"\"\"\n",
+    "    \n",
+    "    condition_input_shape = (32,128,1)\n",
+    "    groundtruth_pianoroll = tf.keras.layers.Input(shape=pianoroll_shape)\n",
+    "    condition_input = tf.keras.layers.Input(shape=condition_input_shape)\n",
+    "    combined_imgs = tf.keras.layers.Concatenate(axis=-1)([groundtruth_pianoroll, condition_input])\n",
+    "\n",
+    "\n",
+    "    \n",
+    "    d1 = _build_critic_layer(combined_imgs, filters)\n",
+    "    d2 = _build_critic_layer(d1, filters * 2)\n",
+    "    d3 = _build_critic_layer(d2, filters * 4)\n",
+    "    d4 = _build_critic_layer(d3, filters * 8)\n",
+    "\n",
+    "    x = tf.keras.layers.Flatten()(d4)\n",
+    "    logit = tf.keras.layers.Dense(1)(x)\n",
+    "\n",
+    "    critic = tf.keras.models.Model([groundtruth_pianoroll,condition_input], logit,\n",
+    "                                          name='Critic')\n",
+    "    \n",
+    "\n",
+    "    return critic"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 34,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Model: \"Critic\"\n",
+      "__________________________________________________________________________________________________\n",
+      "Layer (type)                    Output Shape         Param #     Connected to                     \n",
+      "==================================================================================================\n",
+      "input_5 (InputLayer)            [(None, 32, 128, 4)] 0                                            \n",
+      "__________________________________________________________________________________________________\n",
+      "input_6 (InputLayer)            [(None, 32, 128, 1)] 0                                            \n",
+      "__________________________________________________________________________________________________\n",
+      "concatenate_8 (Concatenate)     (None, 32, 128, 5)   0           input_5[0][0]                    \n",
+      "                                                                 input_6[0][0]                    \n",
+      "__________________________________________________________________________________________________\n",
+      "conv2d_16 (Conv2D)              (None, 16, 64, 64)   5184        concatenate_8[0][0]              \n",
+      "__________________________________________________________________________________________________\n",
+      "leaky_re_lu_8 (LeakyReLU)       (None, 16, 64, 64)   0           conv2d_16[0][0]                  \n",
+      "__________________________________________________________________________________________________\n",
+      "conv2d_17 (Conv2D)              (None, 8, 32, 128)   131200      leaky_re_lu_8[0][0]              \n",
+      "__________________________________________________________________________________________________\n",
+      "leaky_re_lu_9 (LeakyReLU)       (None, 8, 32, 128)   0           conv2d_17[0][0]                  \n",
+      "__________________________________________________________________________________________________\n",
+      "conv2d_18 (Conv2D)              (None, 4, 16, 256)   524544      leaky_re_lu_9[0][0]              \n",
+      "__________________________________________________________________________________________________\n",
+      "leaky_re_lu_10 (LeakyReLU)      (None, 4, 16, 256)   0           conv2d_18[0][0]                  \n",
+      "__________________________________________________________________________________________________\n",
+      "conv2d_19 (Conv2D)              (None, 2, 8, 512)    2097664     leaky_re_lu_10[0][0]             \n",
+      "__________________________________________________________________________________________________\n",
+      "leaky_re_lu_11 (LeakyReLU)      (None, 2, 8, 512)    0           conv2d_19[0][0]                  \n",
+      "__________________________________________________________________________________________________\n",
+      "flatten (Flatten)               (None, 8192)         0           leaky_re_lu_11[0][0]             \n",
+      "__________________________________________________________________________________________________\n",
+      "dense (Dense)                   (None, 1)            8193        flatten[0][0]                    \n",
+      "==================================================================================================\n",
+      "Total params: 2,766,785\n",
+      "Trainable params: 2,766,785\n",
+      "Non-trainable params: 0\n",
+      "__________________________________________________________________________________________________\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Create the Discriminator\n",
+    "\n",
+    "critic = build_critic()\n",
+    "critic.summary() # View discriminator architecture."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Training\n",
+    "\n",
+    "We train our models by searching for model parameters which optimize an objective function. For our WGAN-GP, we have special loss functions that we minimize as we alternate between training our generator and critic networks:\n",
+    "\n",
+    "*Generator Loss:*\n",
+    "* We use the Wasserstein (Generator) loss function which is negative of the Critic Loss function. The generator is trained to bring the generated pianoroll as close to the real pianoroll as possible.\n",
+    "    * $\\frac{1}{m} \\sum_{i=1}^{m} -D_w(G(z^{i}|c^{i})|c^{i})$\n",
+    "\n",
+    "*Critic Loss:*\n",
+    "\n",
+    "* We begin with the Wasserstein (Critic) loss function designed to maximize the distance between the real piano roll distribution and generated (fake) piano roll distribution.\n",
+    "    * $\\frac{1}{m} \\sum_{i=1}^{m} [D_w(G(z^{i}|c^{i})|c^{i}) - D_w(x^{i}|c^{i})]$\n",
+    "\n",
+    "* We add a gradient penalty loss function term designed to control how the gradient of the critic with respect to its input behaves.  This makes optimization of the generator easier. \n",
+    "    * $\\frac{1}{m} \\sum_{i=1}^{m}(\\lVert \\nabla_{\\hat{x}^i}D_w(\\hat{x}^i|c^{i}) \\rVert_2 -  1)^2 $"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Define the different loss functions\n",
+    "\n",
+    "def generator_loss(critic_fake_output):\n",
+    "    \"\"\" Wasserstein GAN loss\n",
+    "    (Generator)  -D(G(z|c))\n",
+    "    \"\"\"\n",
+    "    return -tf.reduce_mean(critic_fake_output)\n",
+    "\n",
+    "\n",
+    "def wasserstein_loss(critic_real_output, critic_fake_output):\n",
+    "    \"\"\" Wasserstein GAN loss\n",
+    "    (Critic)  D(G(z|c)) - D(x|c)\n",
+    "    \"\"\"\n",
+    "    return tf.reduce_mean(critic_fake_output) - tf.reduce_mean(\n",
+    "        critic_real_output)\n",
+    "\n",
+    "\n",
+    "def compute_gradient_penalty(critic, x, fake_x):\n",
+    "    \n",
+    "    c = tf.expand_dims(x[..., 0], -1)\n",
+    "    batch_size = x.get_shape().as_list()[0]\n",
+    "    eps_x = tf.random.uniform(\n",
+    "        [batch_size] + [1] * (len(x.get_shape()) - 1))  # B, 1, 1, 1, 1\n",
+    "    inter = eps_x * x + (1.0 - eps_x) * fake_x\n",
+    "\n",
+    "    with tf.GradientTape() as g:\n",
+    "        g.watch(inter)\n",
+    "        disc_inter_output = critic((inter,c), training=True)\n",
+    "    grads = g.gradient(disc_inter_output, inter)\n",
+    "    slopes = tf.sqrt(1e-8 + tf.reduce_sum(\n",
+    "        tf.square(grads),\n",
+    "        reduction_indices=tf.range(1, grads.get_shape().ndims)))\n",
+    "    gradient_penalty = tf.reduce_mean(tf.square(slopes - 1.0))\n",
+    "    \n",
+    "    return gradient_penalty\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "With our loss functions defined, we associate them with Tensorflow optimizers to define how our model will search for a good set of model parameters. We use the *Adam* algorithm, a commonly used general-purpose optimizer. We also set up checkpoints to save our progress as we train."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Setup Adam optimizers for both G and D\n",
+    "generator_optimizer = tf.keras.optimizers.Adam(1e-3, beta_1=0.5, beta_2=0.9)\n",
+    "critic_optimizer = tf.keras.optimizers.Adam(1e-3, beta_1=0.5, beta_2=0.9)\n",
+    "\n",
+    "# We define our checkpoint directory and where to save trained checkpoints\n",
+    "ckpt = tf.train.Checkpoint(generator=generator,\n",
+    "                           generator_optimizer=generator_optimizer,\n",
+    "                           critic=critic,\n",
+    "                           critic_optimizer=critic_optimizer)\n",
+    "ckpt_manager = tf.train.CheckpointManager(ckpt, check_dir, max_to_keep=5)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Now we define the `generator_train_step` and `critic_train_step` functions, each of which performs a single forward pass on a batch and returns the corresponding loss."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "@tf.function\n",
+    "def generator_train_step(x, condition_track_idx=0):\n",
+    "\n",
+    "    ############################################\n",
+    "    #(1) Update G network: maximize D(G(z|c))\n",
+    "    ############################################\n",
+    "\n",
+    "    # Extract condition track to make real batches pianoroll\n",
+    "    c = tf.expand_dims(x[..., condition_track_idx], -1)\n",
+    "\n",
+    "    # Generate batch of latent vectors\n",
+    "    z = tf.random.truncated_normal([BATCH_SIZE, 2, 8, 512])\n",
+    "\n",
+    "    with tf.GradientTape() as tape:\n",
+    "        fake_x = generator((c, z), training=True)\n",
+    "        fake_output = critic((fake_x,c), training=False)\n",
+    "\n",
+    "        # Calculate Generator's loss based on this generated output\n",
+    "        gen_loss = generator_loss(fake_output)\n",
+    "\n",
+    "    # Calculate gradients for Generator\n",
+    "    gradients_of_generator = tape.gradient(gen_loss,\n",
+    "                                           generator.trainable_variables)\n",
+    "    # Update Generator\n",
+    "    generator_optimizer.apply_gradients(\n",
+    "        zip(gradients_of_generator, generator.trainable_variables))\n",
+    "\n",
+    "    return gen_loss\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "@tf.function\n",
+    "def critic_train_step(x, condition_track_idx=0):\n",
+    "\n",
+    "    ############################################################################\n",
+    "    #(2) Update D network: maximize (D(x|c)) + (1 - D(G(z|c))|c) + GradientPenality() \n",
+    "    ############################################################################\n",
+    "\n",
+    "    # Extract condition track to make real batches pianoroll\n",
+    "    c = tf.expand_dims(x[..., condition_track_idx], -1)\n",
+    "\n",
+    "    # Generate batch of latent vectors\n",
+    "    z = tf.random.truncated_normal([BATCH_SIZE, 2, 8, 512])\n",
+    "\n",
+    "    # Generated fake pianoroll\n",
+    "    fake_x = generator((c, z), training=False)\n",
+    "\n",
+    "\n",
+    "    # Update critic parameters\n",
+    "    with tf.GradientTape() as tape:\n",
+    "        real_output = critic((x,c), training=True)\n",
+    "        fake_output = critic((fake_x,c), training=True)\n",
+    "        critic_loss =  wasserstein_loss(real_output, fake_output)\n",
+    "\n",
+    "    # Caculate the gradients from the real and fake batches\n",
+    "    grads_of_critic = tape.gradient(critic_loss,\n",
+    "                                               critic.trainable_variables)\n",
+    "\n",
+    "    with tf.GradientTape() as tape:\n",
+    "        gp_loss = compute_gradient_penalty(critic, x, fake_x)\n",
+    "        gp_loss *= 10.0\n",
+    "\n",
+    "    # Calculate the gradients penalty from the real and fake batches\n",
+    "    grads_gp = tape.gradient(gp_loss, critic.trainable_variables)\n",
+    "    gradients_of_critic = [g + ggp for g, ggp in\n",
+    "                                  zip(grads_of_critic, grads_gp)\n",
+    "                                  if ggp is not None]\n",
+    "\n",
+    "    # Update Critic\n",
+    "    critic_optimizer.apply_gradients(\n",
+    "        zip(gradients_of_critic, critic.trainable_variables))\n",
+    "\n",
+    "    return critic_loss + gp_loss\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Before we begin training, let's define some training configuration parameters and prepare to monitor important quantities. Here we log the losses and metrics which we can use to determine when to stop training. Consider coming back here to tweak these parameters and explore how your model responds. "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# We use load_melody_samples() to load 10 input data samples from our dataset into sample_x \n",
+    "# and 10 random noise latent vectors into sample_z\n",
+    "sample_x, sample_z = inference_utils.load_melody_samples(n_sample=10)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Number of iterations to train for\n",
+    "iterations = 1000\n",
+    "\n",
+    "# Update critic n times per generator update \n",
+    "n_dis_updates_per_gen_update = 5\n",
+    "\n",
+    "# Determine input track in sample_x that we condition on\n",
+    "condition_track_idx = 0 \n",
+    "sample_c = tf.expand_dims(sample_x[..., condition_track_idx], -1)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Let us now train our model!"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Clear out any old metrics we've collected\n",
+    "metrics_utils.metrics_manager.initialize()\n",
+    "\n",
+    "# Keep a running list of various quantities:\n",
+    "c_losses = []\n",
+    "g_losses = []\n",
+    "\n",
+    "# Data iterator to iterate over our dataset\n",
+    "it = iter(dataset)\n",
+    "\n",
+    "for iteration in range(iterations):\n",
+    "\n",
+    "    # Train critic\n",
+    "    for _ in range(n_dis_updates_per_gen_update):\n",
+    "        c_loss = critic_train_step(next(it))\n",
+    "\n",
+    "    # Train generator\n",
+    "    g_loss = generator_train_step(next(it))\n",
+    "\n",
+    "    # Save Losses for plotting later\n",
+    "    c_losses.append(c_loss)\n",
+    "    g_losses.append(g_loss)\n",
+    "\n",
+    "    display.clear_output(wait=True)\n",
+    "    fig = plt.figure(figsize=(15, 5))\n",
+    "    line1, = plt.plot(range(iteration+1), c_losses, 'r')\n",
+    "    line2, = plt.plot(range(iteration+1), g_losses, 'k')\n",
+    "    plt.xlabel('Iterations')\n",
+    "    plt.ylabel('Losses')\n",
+    "    plt.legend((line1, line2), ('C-loss', 'G-loss'))\n",
+    "    display.display(fig)\n",
+    "    plt.close(fig)\n",
+    "    \n",
+    "    # Output training stats\n",
+    "    print('Iteration {}, c_loss={:.2f}, g_loss={:.2f}'.format(iteration, c_loss, g_loss))\n",
+    "    \n",
+    "    # Save checkpoints, music metrics, generated output\n",
+    "    if iteration < 100 or iteration % 50 == 0 :\n",
+    "        # Check how the generator is doing by saving G's samples on fixed_noise\n",
+    "        fake_sample_x = generator((sample_c, sample_z), training=False)\n",
+    "        metrics_utils.metrics_manager.append_metrics_for_iteration(fake_sample_x.numpy(), iteration)\n",
+    "\n",
+    "        if iteration % 50 == 0:\n",
+    "            # Save the checkpoint to disk.\n",
+    "            ckpt_manager.save(checkpoint_number=iteration) \n",
+    "        \n",
+    "            fake_sample_x = fake_sample_x.numpy()\n",
+    "    \n",
+    "            # plot the pianoroll\n",
+    "            display_utils.plot_pianoroll(iteration, sample_x[:4], fake_sample_x[:4], save_dir=train_dir)\n",
+    "\n",
+    "            # generate the midi\n",
+    "            destination_path = path_utils.generated_midi_path_for_iteration(iteration, saveto_dir=sample_dir)\n",
+    "            midi_utils.save_pianoroll_as_midi(fake_sample_x[:4], destination_path=destination_path)\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### We have started training!\n",
+    "\n",
+    "When using the Wasserstein loss function, we should train the critic to converge to ensure that the gradients for the generator update are accurate. This is in contrast to a standard GAN, where it is important not to let the critic get too strong, to avoid vanishing gradients.\n",
+    "\n",
+    "Therefore, using the Wasserstein loss removes one of the key difficulties of training GANs—how to balance the training of the discriminator and generator. With WGANs, we can simply train the critic several times between generator updates, to ensure it is close to convergence. A typical ratio used is five critic updates to one generator update.\n",
+    "\n",
+    "### \"Babysitting\" the learning process\n",
+    "\n",
+    "Given that training these models can be an investment in time and resources, we must to continuously monitor training in order to catch and address anomalies if/when they occur. Here are some things to look out for:\n",
+    "\n",
+    "**What should the losses look like?**\n",
+    "\n",
+    "The adversarial learning process is highly dynamic and high-frequency oscillations are quite common. However if either loss (critic or generator) skyrockets to huge values, plunges to 0, or get stuck on a single value, there is likely an issue somewhere.\n",
+    "\n",
+    "**Is my model learning?**\n",
+    "- Monitor the critic loss and other music quality metrics (if applicable). Are they following the expected trajectories?\n",
+    "- Monitor the generated samples (piano rolls). Are they improving over time? Do you see evidence of mode collapse? Have you tried listening to your samples?\n",
+    "\n",
+    "**How do I know when to stop?**\n",
+    "- If the samples meet your expectations\n",
+    "- Critic loss no longer improving\n",
+    "- The expected value of the musical quality metrics converge to the corresponding expected value of the same metric on the training data"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### How to measure sample quality during training \n",
+    "\n",
+    "Typically, when training any sort of neural networks, it is standard practice to monitor the value of the loss function throughout the duration of the training. The critic loss in WGANs has been found to correlate well with sample quality.\n",
+    "\n",
+    "While standard mechanisms exist for evaluating the accuracy of more traditional models like classifiers or regressors, evaluating generative models is an active area of research. Within the domain of music generation, this hard problem is even less well-understood.\n",
+    "\n",
+    "To address this, we take high-level measurements of our data and show how well our model produces music that aligns with those measurements. If our model produces music which is close to the mean value of these measurements for our training dataset, our music should match on general “shape”.\n",
+    "\n",
+    "We’ll look at three such measurements:\n",
+    "- **Empty bar rate:** The ratio of empty bars to total number of bars.\n",
+    "- **Pitch histogram distance:** A metric that captures the distribution and position of pitches.\n",
+    "- **In Scale Ratio:** Ratio of the number of notes that are in C major key, which is a common key found in music, to the total number of notes. \n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Evaluate results\n",
+    "\n",
+    "Now that we have finished training, let's find out how we did. We will analyze our model in several ways:\n",
+    "1. Examine how the generator and critic losses changed while training\n",
+    "2. Understand how certain musical metrics changed while training\n",
+    "3. Visualize generated piano roll output for a fixed input at every iteration and create a video\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Let us first restore our last saved checkpoint. If you did not complete training but still want to continue with a pre-trained version, set `TRAIN = False`."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 40,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Latest checkpoint None restored.\n"
+     ]
+    }
+   ],
+   "source": [
+    "ckpt = tf.train.Checkpoint(generator=generator)\n",
+    "ckpt_manager = tf.train.CheckpointManager(ckpt, check_dir, max_to_keep=5)\n",
+    "\n",
+    "ckpt.restore(ckpt_manager.latest_checkpoint).expect_partial()\n",
+    "print('Latest checkpoint {} restored.'.format(ckpt_manager.latest_checkpoint))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Plot losses"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 41,
+   "metadata": {},
+   "outputs": [
+    {
+     "ename": "NameError",
+     "evalue": "name 'g_losses' is not defined",
+     "output_type": "error",
+     "traceback": [
+      "\u001b[0;31m---------------------------------------------------------------------------\u001b[0m",
+      "\u001b[0;31mNameError\u001b[0m                                 Traceback (most recent call last)",
+      "\u001b[0;32m<ipython-input-41-b908fcc6bf94>\u001b[0m in \u001b[0;36m<module>\u001b[0;34m()\u001b[0m\n\u001b[0;32m----> 1\u001b[0;31m \u001b[0mdisplay_utils\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mplot_loss_logs\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mg_losses\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mc_losses\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mfigsize\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;36m15\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0;36m5\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0msmoothing\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0;36m0.01\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m",
+      "\u001b[0;31mNameError\u001b[0m: name 'g_losses' is not defined"
+     ]
+    }
+   ],
+   "source": [
+    "display_utils.plot_loss_logs(g_losses, c_losses, figsize=(15, 5), smoothing=0.01)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Observe how the critic loss (C_loss in the graph) decays to zero as we train. In WGAN-GPs, the critic loss decreases (almost) monotonically as you train."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Plot metrics"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "metrics_utils.metrics_manager.set_reference_metrics(training_data)\n",
+    "metrics_utils.metrics_manager.plot_metrics()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Each row here corresponds to a different music quality metric and each column denotes an instrument track. \n",
+    "\n",
+    "Observe how the expected value of the different metrics (blue scatter) approach the corresponding training set expected values (red) as the number of iterations increase. You might expect to see diminishing returns as the model converges.\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Generated samples during training\n",
+    "\n",
+    "The function below helps you probe intermediate samples generated in the training process. Remember that the conditioned input here is sampled from our training data. Let's start by listening to and observing a sample at iteration 0 and then iteration 100. Notice the difference!\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Enter an iteration number (can be divided by 50) and listen to the midi at that iteration\n",
+    "iteration = 50\n",
+    "midi_file = os.path.join(sample_dir, 'iteration-{}.mid'.format(iteration))\n",
+    "display_utils.playmidi(midi_file)    "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Enter an iteration number (can be divided by 50) and look at the generated pianorolls at that iteration\n",
+    "iteration = 50\n",
+    "pianoroll_png = os.path.join(train_dir, 'sample_iteration_%05d.png' % iteration)\n",
+    "display.Image(filename=pianoroll_png)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Let's see how the generated piano rolls change with the number of iterations."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from IPython.display import Video\n",
+    "\n",
+    "\n",
+    "display_utils.make_training_video(train_dir)\n",
+    "video_path = \"movie.mp4\"\n",
+    "Video(video_path)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Inference "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Generating accompaniment for custom input\n",
+    "\n",
+    "Congratulations! You have trained your very own WGAN-GP to generate music. Let us see how our generator performs on a custom input.\n",
+    "\n",
+    "The function below generates a new song based on \"Twinkle Twinkle Little Star\"."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "latest_midi = inference_utils.generate_midi(generator, eval_dir, input_midi_file='./input_twinkle_twinkle.mid')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "display_utils.playmidi(latest_midi)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We can also take a look at the generated piano rolls for a certain sample, to see how diverse they are!"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "inference_utils.show_generated_pianorolls(generator, eval_dir, input_midi_file='./input_twinkle_twinkle.mid')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# What's next?"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Using your own data  (Optional)\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "To create your own dataset you can extract the piano roll from MIDI data. An example of creating a piano roll from a MIDI file is given below"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import numpy as np\n",
+    "from pypianoroll import Multitrack\n",
+    "\n",
+    "midi_data = Multitrack('./input_twinkle_twinkle.mid')\n",
+    "tracks = [track.pianoroll for track in midi_data.tracks]\n",
+    "sample = np.stack(tracks, axis=-1)\n",
+    "\n",
+    "print(sample.shape)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Appendix"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Open source implementations\n",
+    "For more open-source implementations of generative models for music, check out:\n",
+    "\n",
+    "- [MuseGAN](https://github.com/salu133445/musegan): Official TensorFlow Implementation that uses GANs to generate multi track polyphonic music\n",
+    "- [GANSynth](https://github.com/tensorflow/magenta/tree/master/magenta/models/gansynth): GANSynth uses a Progressive GAN architecture to incrementally upsample with convolution from a single vector to the full audio spectrogram\n",
+    "- [Music Transformer](https://github.com/tensorflow/magenta/tree/master/magenta/models/score2perf): Uses transformers to generate music!\n",
+    "\n",
+    "GANs have also achieved state of the generative modeling in several other domains including cross domain image tranfer, celebrity face generation, super resolution text to image and image inpainting.\n",
+    "\n",
+    "- [Keras-GAN](https://github.com/eriklindernoren/Keras-GAN): Library of reference implementations in Keras for image generation(good for educational purposes).\n",
+    "\n",
+    "There's an ocean of literatures out there that use GANs for modeling distributions across fields! If you are interested, [Gan Zoo](https://github.com/hindupuravinash/the-gan-zoo) is a good place to start."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### References\n",
+    "<a id='references'></a>\n",
+    "1. [Dong, H.W., Hsiao, W.Y., Yang, L.C. and Yang, Y.H., 2018, April. MuseGAN: Multi-track sequential generative adversarial networks for symbolic music generation and accompaniment. In Thirty-Second AAAI Conference on Artificial Intelligence.](https://arxiv.org/abs/1709.06298)\n",
+    "2. [Ishaan, G., Faruk, A., Martin, A., Vincent, D. and Aaron, C., 2017. Improved training of wasserstein gans. In Advances in Neural Information Processing Systems.](https://arxiv.org/abs/1704.00028)\n",
+    "3. [Arjovsky, M., Chintala, S. and Bottou, L., 2017. Wasserstein gan. arXiv preprint arXiv:1701.07875.](https://arxiv.org/abs/1701.07875)\n",
+    "4. [Foster, D., 2019. Generative Deep Learning: Teaching Machines to Paint, Write, Compose, and Play. O'Reilly Media.](https://www.amazon.com/Generative-Deep-Learning-Teaching-Machines/dp/1492041947)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### More on Wassertein GAN with Gradient Penalty (optional)\n",
+    "\n",
+    "While GANs are a major breakthrough for generative modeling, plain GANs are also notoriously difficult to train. Some common problems encountered are:\n",
+    "\n",
+    "* **Oscillating loss:** The loss of the discriminator and generator can start to oscillate without exhibiting any long term stability.\n",
+    "* **Mode collapse:**  The generator may get stuck on a small set of samples that always fool the discriminator. This reduces the capability of the network to produce novel samples.\n",
+    "* **Uninformative loss:** The lack of correlation between the generator loss and quality of generated output makes plain GAN training difficult to interpret.\n",
+    "\n",
+    "\n",
+    "The [Wasserstein GAN](#references) was a major advancement in GANs and helped mitigate to some of these issues. Some of its features are:\n",
+    "\n",
+    "1. It significantly improves the interpretability of loss functions and provides clearer stopping criteria\n",
+    "2. WGANs generally produce results of higher quality (demonstrated within the image generation domain)\n",
+    "\n",
+    "**Mathematics of Wasserstein GAN with Gradient Penalty**\n",
+    "\n",
+    "The [Wasserstein distance](https://en.wikipedia.org/wiki/Wasserstein_metric) between the true distribution $P_r$ and generated piano roll distribution $P_g$ is defined as follows:\n",
+    "\n",
+    "$$\\mathbb{W}(P_{r},P_{g})=\\sup_{\\lVert{f} \\rVert_{L} \\le 1} \\mathbb{E}_{x \\sim \\mathbb{P}_r}(f(x)) - \\mathbb{E}_{x \\sim \\mathbb{P}_g}(f(x)) $$\n",
+    "\n",
+    "In this equation we are trying to minimize the distance between the expectation of the real distribution and the expectation of the generation distribution. $f$ is subject to a technical constraint in that it must be [1-Lipschitz](https://en.wikipedia.org/wiki/Lipschitz_continuity).\n",
+    "\n",
+    "To enforce the 1-Lipschitz condition that basically constraints the gradients from varying too rapidly we use the gradient penalty.\n",
+    "\n",
+    "**Gradient penalty**: We want to penalize the gradients of the critic. We implicitly define $P_{\\hat{x}}$ by sampling uniformly along straight lines between pairs of points sampled from the data distribution $P_r$ and the generator distribution $P_g$.   This was originally motivated by the fact that the optimal critic contains straight lines with gradient norm 1 connecting coupled points from $P_r$ and $P_g$. We use a penalty coefficient $\\lambda$= 10 as was recommended in the original paper. \n",
+    "\n",
+    "The loss with gradient penalty is:\n",
+    "\n",
+    "$$\\mathbb{L}(P_{r},P_{g},P_{\\hat{x}} )= \\mathbb{W}(P_{r},P_{g}) + \\lambda \\mathbb{E}_{\\hat{x} \\sim \\mathbb{P}_\\hat{x}}[(\\lVert \\nabla_{\\hat{x}}D(\\hat{x}) \\rVert_2 -  1)^2]$$\n",
+    "|\n",
+    "This loss can be parametrized in terms of $w$ and $\\theta$. We then use neural networks to learn the functions $f_w$ (discriminator) and  $g_\\theta$ (generator).\n",
+    "$$\\mathbb{W}(P_{r},P_{\\theta})=\\max_{w \\in \\mathbb{W}} \\mathbb{E}_{x \\sim \\mathbb{P}_r}(D_w(x)) - \\mathbb{E}_{z \\sim p(z)}(D_w(G_{\\theta}(z)) $$\n",
+    "$$\\mathbb{L}(P_{r},P_{\\theta},P_{\\hat{x}})=\\max_{w \\in \\mathbb{W}} \\mathbb{E}_{x \\sim \\mathbb{P}_r}(D_w(x)) - \\mathbb{E}_{z \\sim p(z)}(D_w(G_{\\theta}(z)) + \\lambda \\mathbb{E}_{\\hat{x} \\sim \\mathbb{P}_\\hat{x}}[(\\lVert \\nabla_{\\hat{x}}D_w(\\hat{x}) \\rVert_2 -  1)^2]$$\n",
+    "\n",
+    "where $$ \\hat{x} = \\epsilon x + (1- \\epsilon) G(z) $$ and $$\\epsilon \\sim Unif(0,1)$$\n",
+    "\n",
+    "The basic procedure to train is as following: \n",
+    "1. We draw real_x from the real distribution $P_r$ and fake_x from the generated distribution $G_{\\theta}(z)$ where $z \\sim p(z)$\n",
+    "2. The latent vectors are sampled from z and then tranformed using the generator $G_{\\theta}$ to get the fake samples fake_x. They are evaluated using the critic function $D_w$\n",
+    "3. We are trying to minimize the Wasserstein distance between the two distributions\n",
+    "\n",
+    "Both the generator and critic are conditioned on the input pianoroll melody."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "conda_python3",
+   "language": "python",
+   "name": "conda_python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.6.5"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 4
+}
